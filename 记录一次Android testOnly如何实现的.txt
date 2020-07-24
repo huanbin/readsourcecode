@@ -1,0 +1,73 @@
+android.injected.testOnly=false为啥能解决run方式生成的apk文件不能在手机上直接安装问题
+    注意：通过adb命令是可以安装的
+
+1.第一步gradle执行入口GradleWrapperMain main方法
+
+2.第二步管件类DefaultGradleLauncher（GradleLauncher） 该类负责自动时各个流程的处理，包括LoadSettings, Configure, TaskGraph, RunTasks，Finished
+
+
+主要目标分析gradle.properties如何处理的
+
+ 1.接下来查看每一个流程，最后锁定ConfigureBuild（配置）---->buildLoader.load()---->ProjectPropertySettingBuildLoader(Loader实现类)重写load方法，添加了setProjectProperties方法处理-----》
+addPropertiesToProject方法
+
+ 2.最终锁定ProjectPropertySettingBuildLoader类的addPropertiesToProject方法
+
+ 在这个方法里面获取了gradle.properties文件（文件名称是在Project.java中定义的GRADLE_PROPERTIES字段）
+
+    这里有几个相关重要类：
+        1.DefaultGradlePropertiesLoader类（IGradlePropertiesLoader接口）
+        负责实现properties的合并（这里涉及到属性配置优先级的顺序）gradle_user_home > project > 默认属性
+        2.CachingPropertyApplicator
+         2.1将合并之后遍历素有属性configureProperty
+         2.2首先经过多次判断，其中会判断该属性存不存在（通过属性名称拼接seeter方法（set+属性名第一个字符大写+从属性名第一个字符截取），反射获取该方法是否存在，不存在不处理），
+            存在该属性的seeter方法时（会创建一个PropertyMutator接口实例MethodBackedPropertyMutator），会保存PropertyMutator对象，调用PropertyMutator的setValue方法（propertyMutator.setValue(project, value)），本质上是调用反射project的setter方法设置属性
+         2.3设置完上面的属性之后，接着处理ExtraPropertiesExtension（也就是ext中配置的属性）,
+            调用DefaultExtraPropertiesExtension类（ExtraPropertiesExtension接口的实现类）的set方法，存储到内部的Map集合storage字段中
+ 3.看完第二部，可以确定gradle.properties中的属性是在Project中完成设置的，所以Project中应该有属性和setter方法相关内容
+    Project接口实现类?
+
+ 4.看完上一步，似乎要找到Android Gradle Plugin中对应的Android Project实现类，但是根本就没有？
+ 查看com.android.tools.build:gradle:3.5.1(对应的Android Gradle Plugin)源码目录下internal目录下有一个ide目录，至此猜想有些配置可能是开发工具相关的，正好之前研究发现testOnly属性是application标签中设置的属性，但是就算是修改属性值为false,AndroidStudio在run命令执行安装app时，
+ 仍旧会将testOnly属性修改为true,这样该apk包只能用于测试，手机上直接安装会失败。至此发现关联了，接下来细看。
+
+5.发现DefaultAndroidProject-----》AndroidProject接口，惊喜一下，终于找到所有的定义，包括android.injected.testOnly还有其它的
+  所以在gradle构建过程中会将这些gradle.properties属性读取到，至于如何将AndroidProject实现类与Gradle构建关联起来的，还没看明白。
+
+6.首先突破口有2点：
+    6.1直接查找与Manifest操作相关的类，没有啥思路？
+    6.2通过DefaultAndroidProject，查找何处实例化该类的
+    通过DefaultAndroidProject查找到ModelBuilder类（负责构建android project model）的buildAndroidProject方法，
+    然后跟踪发现ProjectOptions很可疑，进一步发现：Determines if various options, triggered from the command line or environment, are set。
+    意思是该类决定是否从命令行和环境参数中触发一些可选参数，本质就是这里包含了所有的属性配置（通过代码，他就是把Project中的属性全部copy过来了）
+
+7.上面发现GlobalScope
+    分析：GlobalScope可以获取Project，Porject可以获取所有的属性
+
+    7.1从GlobalScope入手，继续查看哪些地方调用GlobalScope类的getProject()方法，看名字很快发现可能是ProcessApplicationManifest。
+    在configure方法中有一个task optionalFeatures处理（Features特性）getOptionalFeatures，仔细看发现其实调用的是ProcessApplicationManifest类，
+    终于发现：
+      if (variantScope.isTestOnly()) {
+         features.add(Feature.TEST_ONLY);
+      }
+    也就是这里添加android:testOnly="true"，根据Feature.TEST_ONLY的注释信息，得知这是用于避免将该类测试包上传到play store上
+    而ProcessApplicationManifest类的注释信息：A task that processes the manifest，便发现它是一个处理Manifest类的gradle task。
+
+    7.2VariantScope接口的实现类：VariantScopeImpl，仔细看是如何实现testOnly
+    主要代码如下：最终还是从ProjectOptions获取AndroidProject.PROPERTY_TEST_ONLY属性
+            ProjectOptions projectOptions = globalScope.getProjectOptions();
+            Boolean isTestOnlyOverride = projectOptions.get(OptionalBooleanOption.IDE_TEST_ONLY);
+
+            if (isTestOnlyOverride != null) {
+                return isTestOnlyOverride;
+            }
+至此，分析完整个流程
+ 1.包括Gradle如何加载gradle.properties(Project.java中定义全局属性文件名称)---->DefaultGradlePropertiesLoader解析属性并将属性全部设置到Project对象中
+ 2.DefaultAndroidProject只是一个Model，ModelBuilder是负责初始化model（buildAndroidProject），初始化ProjectOptions，将Project中属性全部copy过来.
+ Android所有的构建构成从此开始,包括ide版本\aapt等等各种配置参数检车,Manifest的处理也在这里。
+
+大概走一次流程，但是还没有充分理解。通过有迹可循，明白最终始终是需要修改Manifest，而修改manifest肯定需要获取gradle.properties属性，顺着Android层是如何获取全局属性，然后修改manifest这条主线分析（分析哪几种方法+猜想）。
+
+
+
+
